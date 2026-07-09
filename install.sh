@@ -436,6 +436,32 @@ setup_ssl_certificate() {
     fi
 }
 
+setup_self_signed_certificate() {
+    local domain="$1"
+    local certPath="/root/cert/${domain}"
+    
+    echo -e "${green}Generating self-signed SSL certificate...${plain}"
+    mkdir -p "$certPath"
+    
+    openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=${domain}" \
+        -keyout "${certPath}/privkey.pem" \
+        -out "${certPath}/fullchain.pem" >/dev/null 2>&1
+        
+    if [ $? -ne 0 ]; then
+        echo -e "${red}Failed to generate self-signed certificate${plain}"
+        rm -rf "$certPath" 2>/dev/null
+        return 1
+    fi
+    
+    # Secure permissions
+    chmod 600 "${certPath}/privkey.pem" 2>/dev/null
+    chmod 644 "${certPath}/fullchain.pem" 2>/dev/null
+    
+    # Configure panel to use the certificate
+    ${xui_folder}/x-ui cert -webCert "${certPath}/fullchain.pem" -webCertKey "${certPath}/privkey.pem" >/dev/null 2>&1
+}
+
 # Issue Let's Encrypt IP certificate with shortlived profile (~6 days validity)
 # Requires acme.sh and port 80 open for HTTP-01 challenge
 setup_ip_certificate() {
@@ -824,26 +850,30 @@ prompt_and_setup_ssl() {
     echo -e "${green}1.${plain} Let's Encrypt for Domain (90-day validity, auto-renews)"
     echo -e "${green}2.${plain} Let's Encrypt for IP Address (6-day validity, auto-renews)"
     echo -e "${green}3.${plain} Custom SSL Certificate (Path to existing files)"
-    echo -e "${green}4.${plain} Skip SSL (advanced — behind reverse proxy / SSH tunnel only)"
+    echo -e "${green}4.${plain} Self-signed Certificate (Testing/local use)"
+    echo -e "${green}5.${plain} Skip SSL (advanced — behind reverse proxy / SSH tunnel only)"
     echo -e "${blue}Note:${plain} Options 1 & 2 require port 80 open. Option 3 requires manual paths."
-    echo -e "${blue}Note:${plain} Option 4 serves the panel over plain HTTP — only safe behind nginx/Caddy or an SSH tunnel."
+    echo -e "${blue}Note:${plain} Option 4 generates a self-signed certificate locally on this server."
+    echo -e "${blue}Note:${plain} Option 5 serves the panel over plain HTTP — only safe behind nginx/Caddy or an SSH tunnel."
     if [[ "$NONINTERACTIVE" == "1" ]]; then
         case "${XUI_SSL_MODE:-none}" in
             domain) ssl_choice="1" ;;
             ip) ssl_choice="2" ;;
-            none | "") ssl_choice="4" ;;
+            custom) ssl_choice="3" ;;
+            self) ssl_choice="4" ;;
+            none | "") ssl_choice="5" ;;
             *)
                 echo -e "${yellow}Unknown XUI_SSL_MODE='${XUI_SSL_MODE}', defaulting to none (HTTP).${plain}"
-                ssl_choice="4"
+                ssl_choice="5"
                 ;;
         esac
     else
-        read -rp "Choose an option (default 2 for IP): " ssl_choice
+        read -rp "Choose an option (default 5 for Skip SSL): " ssl_choice
         ssl_choice="${ssl_choice// /}" # Trim whitespace
 
-        # Default to 2 (IP cert) if input is empty or invalid (not 1, 3 or 4)
-        if [[ "$ssl_choice" != "1" && "$ssl_choice" != "3" && "$ssl_choice" != "4" ]]; then
-            ssl_choice="2"
+        # Default to 5 (Skip SSL) if input is empty or invalid (not 1, 2, 3, 4 or 5)
+        if [[ "$ssl_choice" != "1" && "$ssl_choice" != "2" && "$ssl_choice" != "3" && "$ssl_choice" != "4" && "$ssl_choice" != "5" ]]; then
+            ssl_choice="5"
         fi
     fi
 
@@ -955,6 +985,32 @@ prompt_and_setup_ssl() {
             systemctl restart x-ui > /dev/null 2>&1 || rc-service x-ui restart > /dev/null 2>&1
             ;;
         4)
+            # User chose self-signed certificate option
+            echo -e "${green}Using server IP for self-signed certificate...${plain}"
+            # Stop panel if running
+            if [[ $release == "alpine" ]]; then
+                rc-service x-ui stop > /dev/null 2>&1
+            else
+                systemctl stop x-ui > /dev/null 2>&1
+            fi
+
+            setup_self_signed_certificate "${server_ip}"
+            if [ $? -eq 0 ]; then
+                SSL_HOST="${server_ip}"
+                echo -e "${green}✓ Self-signed SSL configured successfully${plain}"
+            else
+                echo -e "${red}✗ Self-signed SSL setup failed${plain}"
+                SSL_HOST="${server_ip}"
+            fi
+
+            # Start panel after SSL is configured
+            if [[ $release == "alpine" ]]; then
+                rc-service x-ui start > /dev/null 2>&1
+            else
+                systemctl start x-ui > /dev/null 2>&1
+            fi
+            ;;
+        5)
             echo ""
             echo -e "${red}⚠ Panel will be installed WITHOUT SSL/TLS.${plain}"
             echo -e "${yellow}Login credentials and cookies will travel as plain HTTP.${plain}"
@@ -1399,53 +1455,66 @@ install_x-ui() {
     cd ${xui_folder%/x-ui}/
 
     # Download resources
-    if [ $# == 0 ]; then
-        tag_version=$(curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$tag_version" ]]; then
-            echo -e "${red}Failed to fetch x-ui version, it may be due to GitHub API restrictions, please try it later${plain}"
-            exit 1
-        fi
-        echo -e "Got x-ui latest version: ${tag_version}, beginning the installation..."
-        curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 300 -o ${xui_folder}-linux-$(arch).tar.gz https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Downloading x-ui failed, please be sure that your server can access GitHub ${plain}"
-            exit 1
-        fi
-        if [[ ! -s ${xui_folder}-linux-$(arch).tar.gz ]]; then
-            rm ${xui_folder}-linux-$(arch).tar.gz -f
-            echo -e "${red}Downloaded x-ui release archive is empty${plain}"
-            exit 1
-        fi
-    else
+    local tag_version=""
+    if [ $# -gt 0 ]; then
         tag_version=$1
-        # The rolling dev channel ships under a fixed, non-semver tag that is
-        # force-moved to the latest main commit on every push. Accept `dev` as a
-        # convenient alias and skip the numeric floor check for it.
-        if [[ "$tag_version" == "dev" || "$tag_version" == "dev-latest" ]]; then
-            tag_version="dev-latest"
-            echo -e "${yellow}Installing the rolling dev build (tag: dev-latest). This is a per-commit pre-release, not a stable version.${plain}"
+    else
+        if [[ "$NONINTERACTIVE" == "1" ]]; then
+            tag_version=$(curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         else
-            tag_version_numeric=${tag_version#v}
-            min_version="2.3.5"
-
-            if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
-                echo -e "${red}Please use a newer version (at least v2.3.5). Exiting installation.${plain}"
-                exit 1
+            echo -e "${green}Please select 3x-ui version to install:${plain}"
+            echo -e "1) Install latest version (default)"
+            echo -e "2) Choose a specific version"
+            read -rp "Select [1]: " version_choice
+            version_choice="${version_choice:-1}"
+            
+            if [[ "$version_choice" == "2" ]]; then
+                read -rp "Enter version to install (e.g. v2.4.0): " user_version
+                user_version="${user_version// /}"
+                if [[ -z "$user_version" ]]; then
+                    echo -e "${red}Invalid version, using latest version.${plain}"
+                    tag_version=$(curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+                else
+                    if [[ ! "$user_version" =~ ^v && "$user_version" != "dev" && "$user_version" != "dev-latest" ]]; then
+                        user_version="v${user_version}"
+                    fi
+                    tag_version="$user_version"
+                fi
+            else
+                tag_version=$(curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
             fi
         fi
+    fi
 
-        url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
-        echo -e "Beginning to install x-ui ${tag_version}"
-        curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 300 -o ${xui_folder}-linux-$(arch).tar.gz ${url}
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Download x-ui ${tag_version} failed, please check if the version exists ${plain}"
+    if [[ ! -n "$tag_version" ]]; then
+        echo -e "${red}Failed to fetch x-ui version, it may be due to GitHub API restrictions, please try it later${plain}"
+        exit 1
+    fi
+
+    if [[ "$tag_version" == "dev" || "$tag_version" == "dev-latest" ]]; then
+        tag_version="dev-latest"
+        echo -e "${yellow}Installing the rolling dev build (tag: dev-latest). This is a per-commit pre-release, not a stable version.${plain}"
+    else
+        tag_version_numeric=${tag_version#v}
+        min_version="2.3.5"
+
+        if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
+            echo -e "${red}Please use a newer version (at least v2.3.5). Exiting installation.${plain}"
             exit 1
         fi
-        if [[ ! -s ${xui_folder}-linux-$(arch).tar.gz ]]; then
-            rm ${xui_folder}-linux-$(arch).tar.gz -f
-            echo -e "${red}Downloaded x-ui release archive is empty${plain}"
-            exit 1
-        fi
+    fi
+
+    echo -e "Beginning to install x-ui ${tag_version}..."
+    local url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
+    curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 300 -o ${xui_folder}-linux-$(arch).tar.gz ${url}
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}Downloading x-ui ${tag_version} failed, please check if the version exists ${plain}"
+        exit 1
+    fi
+    if [[ ! -s ${xui_folder}-linux-$(arch).tar.gz ]]; then
+        rm ${xui_folder}-linux-$(arch).tar.gz -f
+        echo -e "${red}Downloaded x-ui release archive is empty${plain}"
+        exit 1
     fi
     local xui_script_temp="/usr/bin/x-ui-temp.$$"
     rm -f "${xui_script_temp}"
